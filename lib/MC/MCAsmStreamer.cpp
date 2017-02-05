@@ -100,7 +100,7 @@ public:
   /// file if applicable as a QoI issue to make the output of the compiler
   /// more readable.  This only affects the MCAsmStreamer, and only when
   /// verbose assembly output is enabled.
-  void AddComment(const Twine &T) override;
+  void AddComment(const Twine &T, bool EOL = true) override;
 
   /// AddEncodingComment - Add a comment showing the encoding of an instruction.
   void AddEncodingComment(const MCInst &Inst, const MCSubtargetInfo &);
@@ -150,8 +150,8 @@ public:
   void EndCOFFSymbolDef() override;
   void EmitCOFFSafeSEH(MCSymbol const *Symbol) override;
   void EmitCOFFSectionIndex(MCSymbol const *Symbol) override;
-  void EmitCOFFSecRel32(MCSymbol const *Symbol) override;
-  void emitELFSize(MCSymbolELF *Symbol, const MCExpr *Value) override;
+  void EmitCOFFSecRel32(MCSymbol const *Symbol, uint64_t Offset) override;
+  void emitELFSize(MCSymbol *Symbol, const MCExpr *Value) override;
   void EmitCommonSymbol(MCSymbol *Symbol, uint64_t Size,
                         unsigned ByteAlignment) override;
 
@@ -209,7 +209,8 @@ public:
                          unsigned MaxBytesToEmit = 0) override;
 
   void emitValueToOffset(const MCExpr *Offset,
-                         unsigned char Value = 0) override;
+                         unsigned char Value,
+                         SMLoc Loc) override;
 
   void EmitFileDirective(StringRef Filename) override;
   unsigned EmitDwarfFileDirective(unsigned FileNo, StringRef Directory,
@@ -222,15 +223,20 @@ public:
   MCSymbol *getDwarfLineTableSymbol(unsigned CUID) override;
 
   bool EmitCVFileDirective(unsigned FileNo, StringRef Filename) override;
+  bool EmitCVFuncIdDirective(unsigned FuncId) override;
+  bool EmitCVInlineSiteIdDirective(unsigned FunctionId, unsigned IAFunc,
+                                   unsigned IAFile, unsigned IALine,
+                                   unsigned IACol, SMLoc Loc) override;
   void EmitCVLocDirective(unsigned FunctionId, unsigned FileNo, unsigned Line,
                           unsigned Column, bool PrologueEnd, bool IsStmt,
-                          StringRef FileName) override;
+                          StringRef FileName, SMLoc Loc) override;
   void EmitCVLinetableDirective(unsigned FunctionId, const MCSymbol *FnStart,
                                 const MCSymbol *FnEnd) override;
-  void EmitCVInlineLinetableDirective(
-      unsigned PrimaryFunctionId, unsigned SourceFileId, unsigned SourceLineNum,
-      const MCSymbol *FnStartSym, const MCSymbol *FnEndSym,
-      ArrayRef<unsigned> SecondaryFunctionIds) override;
+  void EmitCVInlineLinetableDirective(unsigned PrimaryFunctionId,
+                                      unsigned SourceFileId,
+                                      unsigned SourceLineNum,
+                                      const MCSymbol *FnStartSym,
+                                      const MCSymbol *FnEndSym) override;
   void EmitCVDefRangeDirective(
       ArrayRef<std::pair<const MCSymbol *, const MCSymbol *>> Ranges,
       StringRef FixedSizePortion) override;
@@ -295,12 +301,14 @@ public:
 /// file if applicable as a QoI issue to make the output of the compiler
 /// more readable.  This only affects the MCAsmStreamer, and only when
 /// verbose assembly output is enabled.
-void MCAsmStreamer::AddComment(const Twine &T) {
+/// By deafult EOL is set to true so that each comment goes on its own line.
+void MCAsmStreamer::AddComment(const Twine &T, bool EOL) {
   if (!IsVerboseAsm) return;
 
   T.toVector(CommentToEmit);
-  // Each comment goes on its own line.
-  CommentToEmit.push_back('\n');
+ 
+  if (EOL)
+    CommentToEmit.push_back('\n'); // Place comment in a new line.
 }
 
 void MCAsmStreamer::EmitCommentsAndEOL() {
@@ -384,7 +392,9 @@ void MCAsmStreamer::emitExplicitComments() {
 void MCAsmStreamer::ChangeSection(MCSection *Section,
                                   const MCExpr *Subsection) {
   assert(Section && "Cannot switch to a null section!");
-  Section->PrintSwitchToSection(*MAI, OS, Subsection);
+  Section->PrintSwitchToSection(
+      *MAI, getContext().getObjectFileInfo()->getTargetTriple(), OS,
+      Subsection);
 }
 
 void MCAsmStreamer::EmitLabel(MCSymbol *Symbol) {
@@ -609,13 +619,15 @@ void MCAsmStreamer::EmitCOFFSectionIndex(MCSymbol const *Symbol) {
   EmitEOL();
 }
 
-void MCAsmStreamer::EmitCOFFSecRel32(MCSymbol const *Symbol) {
+void MCAsmStreamer::EmitCOFFSecRel32(MCSymbol const *Symbol, uint64_t Offset) {
   OS << "\t.secrel32\t";
   Symbol->print(OS, MAI);
+  if (Offset != 0)
+    OS << '+' << Offset;
   EmitEOL();
 }
 
-void MCAsmStreamer::emitELFSize(MCSymbolELF *Symbol, const MCExpr *Value) {
+void MCAsmStreamer::emitELFSize(MCSymbol *Symbol, const MCExpr *Value) {
   assert(MAI->hasDotTypeDotSizeDirective());
   OS << "\t.size\t";
   Symbol->print(OS, MAI);
@@ -744,7 +756,7 @@ static void PrintQuotedString(StringRef Data, raw_ostream &OS) {
 }
 
 void MCAsmStreamer::EmitBytes(StringRef Data) {
-  assert(getCurrentSection().first &&
+  assert(getCurrentSectionOnly() &&
          "Cannot emit contents before setting section!");
   if (Data.empty()) return;
 
@@ -789,7 +801,7 @@ void MCAsmStreamer::EmitIntValue(uint64_t Value, unsigned Size) {
 void MCAsmStreamer::EmitValueImpl(const MCExpr *Value, unsigned Size,
                                   SMLoc Loc) {
   assert(Size <= 8 && "Invalid size");
-  assert(getCurrentSection().first &&
+  assert(getCurrentSectionOnly() &&
          "Cannot emit contents before setting section!");
   const char *Directive = nullptr;
   switch (Size) {
@@ -1006,7 +1018,8 @@ void MCAsmStreamer::EmitCodeAlignment(unsigned ByteAlignment,
 }
 
 void MCAsmStreamer::emitValueToOffset(const MCExpr *Offset,
-                                      unsigned char Value) {
+                                      unsigned char Value,
+                                      SMLoc Loc) {
   // FIXME: Verify that Offset is associated with the current section.
   OS << ".org ";
   Offset->print(OS, MAI);
@@ -1114,10 +1127,26 @@ bool MCAsmStreamer::EmitCVFileDirective(unsigned FileNo, StringRef Filename) {
   return true;
 }
 
+bool MCAsmStreamer::EmitCVFuncIdDirective(unsigned FuncId) {
+  OS << "\t.cv_func_id " << FuncId << '\n';
+  return MCStreamer::EmitCVFuncIdDirective(FuncId);
+}
+
+bool MCAsmStreamer::EmitCVInlineSiteIdDirective(unsigned FunctionId,
+                                                unsigned IAFunc,
+                                                unsigned IAFile,
+                                                unsigned IALine, unsigned IACol,
+                                                SMLoc Loc) {
+  OS << "\t.cv_inline_site_id " << FunctionId << " within " << IAFunc
+     << " inlined_at " << IAFile << ' ' << IALine << ' ' << IACol << '\n';
+  return MCStreamer::EmitCVInlineSiteIdDirective(FunctionId, IAFunc, IAFile,
+                                                 IALine, IACol, Loc);
+}
+
 void MCAsmStreamer::EmitCVLocDirective(unsigned FunctionId, unsigned FileNo,
                                        unsigned Line, unsigned Column,
                                        bool PrologueEnd, bool IsStmt,
-                                       StringRef FileName) {
+                                       StringRef FileName, SMLoc Loc) {
   OS << "\t.cv_loc\t" << FunctionId << " " << FileNo << " " << Line << " "
      << Column;
   if (PrologueEnd)
@@ -1135,12 +1164,12 @@ void MCAsmStreamer::EmitCVLocDirective(unsigned FunctionId, unsigned FileNo,
 
   if (IsVerboseAsm) {
     OS.PadToColumn(MAI->getCommentColumn());
-    OS << MAI->getCommentString() << ' ' << FileName << ':'
-       << Line << ':' << Column;
+    OS << MAI->getCommentString() << ' ' << FileName << ':' << Line << ':'
+       << Column;
   }
   EmitEOL();
   this->MCStreamer::EmitCVLocDirective(FunctionId, FileNo, Line, Column,
-                                       PrologueEnd, IsStmt, FileName);
+                                       PrologueEnd, IsStmt, FileName, Loc);
 }
 
 void MCAsmStreamer::EmitCVLinetableDirective(unsigned FunctionId,
@@ -1154,24 +1183,19 @@ void MCAsmStreamer::EmitCVLinetableDirective(unsigned FunctionId,
   this->MCStreamer::EmitCVLinetableDirective(FunctionId, FnStart, FnEnd);
 }
 
-void MCAsmStreamer::EmitCVInlineLinetableDirective(
-    unsigned PrimaryFunctionId, unsigned SourceFileId, unsigned SourceLineNum,
-    const MCSymbol *FnStartSym, const MCSymbol *FnEndSym,
-    ArrayRef<unsigned> SecondaryFunctionIds) {
+void MCAsmStreamer::EmitCVInlineLinetableDirective(unsigned PrimaryFunctionId,
+                                                   unsigned SourceFileId,
+                                                   unsigned SourceLineNum,
+                                                   const MCSymbol *FnStartSym,
+                                                   const MCSymbol *FnEndSym) {
   OS << "\t.cv_inline_linetable\t" << PrimaryFunctionId << ' ' << SourceFileId
      << ' ' << SourceLineNum << ' ';
   FnStartSym->print(OS, MAI);
   OS << ' ';
   FnEndSym->print(OS, MAI);
-  if (!SecondaryFunctionIds.empty()) {
-    OS << " contains";
-    for (unsigned SecondaryFunctionId : SecondaryFunctionIds)
-      OS << ' ' << SecondaryFunctionId;
-  }
   EmitEOL();
   this->MCStreamer::EmitCVInlineLinetableDirective(
-      PrimaryFunctionId, SourceFileId, SourceLineNum, FnStartSym, FnEndSym,
-      SecondaryFunctionIds);
+      PrimaryFunctionId, SourceFileId, SourceLineNum, FnStartSym, FnEndSym);
 }
 
 void MCAsmStreamer::EmitCVDefRangeDirective(
@@ -1564,8 +1588,9 @@ void MCAsmStreamer::AddEncodingComment(const MCInst &Inst,
   }
 }
 
-void MCAsmStreamer::EmitInstruction(const MCInst &Inst, const MCSubtargetInfo &STI) {
-  assert(getCurrentSection().first &&
+void MCAsmStreamer::EmitInstruction(const MCInst &Inst,
+                                    const MCSubtargetInfo &STI) {
+  assert(getCurrentSectionOnly() &&
          "Cannot emit contents before setting section!");
 
   // Show the encoding in a comment if we have a code emitter.

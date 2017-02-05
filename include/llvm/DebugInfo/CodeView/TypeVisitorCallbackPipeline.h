@@ -1,4 +1,4 @@
-//===- TypeVisitorCallbackPipeline.h -------------------------- *- C++ --*-===//
+//===- TypeVisitorCallbackPipeline.h ----------------------------*- C++ -*-===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -13,17 +13,17 @@
 #include "llvm/DebugInfo/CodeView/CodeView.h"
 #include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/CodeView/TypeVisitorCallbacks.h"
-
+#include "llvm/Support/Error.h"
 #include <vector>
 
 namespace llvm {
 namespace codeview {
+
 class TypeVisitorCallbackPipeline : public TypeVisitorCallbacks {
 public:
-  TypeVisitorCallbackPipeline() {}
+  TypeVisitorCallbackPipeline() = default;
 
-  virtual Error
-  visitUnknownType(const CVRecord<TypeLeafKind> &Record) override {
+  Error visitUnknownType(CVRecord<TypeLeafKind> &Record) override {
     for (auto Visitor : Pipeline) {
       if (auto EC = Visitor->visitUnknownType(Record))
         return EC;
@@ -31,8 +31,7 @@ public:
     return Error::success();
   }
 
-  virtual Error
-  visitUnknownMember(const CVRecord<TypeLeafKind> &Record) override {
+  Error visitUnknownMember(CVMemberRecord &Record) override {
     for (auto Visitor : Pipeline) {
       if (auto EC = Visitor->visitUnknownMember(Record))
         return EC;
@@ -40,25 +39,33 @@ public:
     return Error::success();
   }
 
-  virtual Expected<TypeLeafKind>
-  visitTypeBegin(const CVRecord<TypeLeafKind> &Record) override {
-    // An implementation can calculate of visitTypeBegin() can calculate the
-    // kind based on an arbitrary factor, including the Type that is already
-    // specified in the Record.  So, as we go through the pipeline invoking
-    // each visitor, update the state in a copy of the record so that each
-    // visitor in the pipeline sees the most recently value of the type.
-    CVRecord<TypeLeafKind> RecordCopy = Record;
+  Error visitTypeBegin(CVType &Record) override {
     for (auto Visitor : Pipeline) {
-      if (auto ExpectedKind = Visitor->visitTypeBegin(RecordCopy)) {
-        RecordCopy.Type = *ExpectedKind;
-      } else
-        return ExpectedKind.takeError();
+      if (auto EC = Visitor->visitTypeBegin(Record))
+        return EC;
     }
-    return RecordCopy.Type;
+    return Error::success();
   }
-  virtual Error visitTypeEnd(const CVRecord<TypeLeafKind> &Record) override {
+
+  Error visitTypeEnd(CVType &Record) override {
     for (auto Visitor : Pipeline) {
       if (auto EC = Visitor->visitTypeEnd(Record))
+        return EC;
+    }
+    return Error::success();
+  }
+
+  Error visitMemberBegin(CVMemberRecord &Record) override {
+    for (auto Visitor : Pipeline) {
+      if (auto EC = Visitor->visitMemberBegin(Record))
+        return EC;
+    }
+    return Error::success();
+  }
+
+  Error visitMemberEnd(CVMemberRecord &Record) override {
+    for (auto Visitor : Pipeline) {
+      if (auto EC = Visitor->visitMemberEnd(Record))
         return EC;
     }
     return Error::success();
@@ -69,24 +76,39 @@ public:
   }
 
 #define TYPE_RECORD(EnumName, EnumVal, Name)                                   \
-  Error visitKnownRecord(const CVRecord<TypeLeafKind> &CVR,                    \
-                         Name##Record &Record) override {                      \
-    for (auto Visitor : Pipeline) {                                            \
-      if (auto EC = Visitor->visitKnownRecord(CVR, Record))                    \
-        return EC;                                                             \
-    }                                                                          \
-    return Error::success();                                                   \
+  Error visitKnownRecord(CVType &CVR, Name##Record &Record) override {         \
+    return visitKnownRecordImpl(CVR, Record);                                  \
   }
 #define MEMBER_RECORD(EnumName, EnumVal, Name)                                 \
-  TYPE_RECORD(EnumName, EnumVal, Name)
+  Error visitKnownMember(CVMemberRecord &CVMR, Name##Record &Record)           \
+      override {                                                               \
+    return visitKnownMemberImpl(CVMR, Record);                                 \
+  }
 #define TYPE_RECORD_ALIAS(EnumName, EnumVal, Name, AliasName)
 #define MEMBER_RECORD_ALIAS(EnumName, EnumVal, Name, AliasName)
 #include "llvm/DebugInfo/CodeView/TypeRecords.def"
 
 private:
+  template <typename T> Error visitKnownRecordImpl(CVType &CVR, T &Record) {
+    for (auto Visitor : Pipeline) {
+      if (auto EC = Visitor->visitKnownRecord(CVR, Record))
+        return EC;
+    }
+    return Error::success();
+  }
+
+  template <typename T>
+  Error visitKnownMemberImpl(CVMemberRecord &CVMR, T &Record) {
+    for (auto Visitor : Pipeline) {
+      if (auto EC = Visitor->visitKnownMember(CVMR, Record))
+        return EC;
+    }
+    return Error::success();
+  }
   std::vector<TypeVisitorCallbacks *> Pipeline;
 };
-}
-}
 
-#endif
+} // end namespace codeview
+} // end namespace llvm
+
+#endif // LLVM_DEBUGINFO_CODEVIEW_TYPEVISITORCALLBACKPIPELINE_H

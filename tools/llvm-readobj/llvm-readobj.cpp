@@ -22,7 +22,7 @@
 #include "llvm-readobj.h"
 #include "Error.h"
 #include "ObjDumper.h"
-#include "llvm/DebugInfo/CodeView/MemoryTypeTableBuilder.h"
+#include "llvm/DebugInfo/CodeView/TypeTableBuilder.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/COFFImportFile.h"
 #include "llvm/Object/ELFObjectFile.h"
@@ -166,7 +166,7 @@ namespace opts {
   // -arm-attributes, -a
   cl::opt<bool> ARMAttributes("arm-attributes",
                               cl::desc("Display the ARM attributes section"));
-  cl::alias ARMAttributesShort("-a", cl::desc("Alias for --arm-attributes"),
+  cl::alias ARMAttributesShort("a", cl::desc("Alias for --arm-attributes"),
                                cl::aliasopt(ARMAttributes));
 
   // -mips-plt-got
@@ -185,6 +185,10 @@ namespace opts {
   // -mips-options
   cl::opt<bool> MipsOptions("mips-options",
                             cl::desc("Display the MIPS .MIPS.options section"));
+
+  // -amdgpu-runtime-metadata
+  cl::opt<bool> AMDGPURuntimeMD("amdgpu-runtime-metadata",
+                                cl::desc("Display AMDGPU runtime metadata"));
 
   // -coff-imports
   cl::opt<bool>
@@ -264,7 +268,7 @@ namespace opts {
   cl::opt<OutputStyleTy>
       Output("elf-output-style", cl::desc("Specify ELF dump style"),
              cl::values(clEnumVal(LLVM, "LLVM default style"),
-                        clEnumVal(GNU, "GNU readelf style"), clEnumValEnd),
+                        clEnumVal(GNU, "GNU readelf style")),
              cl::init(LLVM));
 } // namespace opts
 
@@ -331,8 +335,15 @@ static bool isMipsArch(unsigned Arch) {
     return false;
   }
 }
+namespace {
+struct ReadObjTypeTableBuilder {
+  ReadObjTypeTableBuilder() : Allocator(), Builder(Allocator) {}
 
-static llvm::codeview::MemoryTypeTableBuilder CVTypes;
+  llvm::BumpPtrAllocator Allocator;
+  llvm::codeview::TypeTableBuilder Builder;
+};
+}
+static ReadObjTypeTableBuilder CVTypes;
 
 /// @brief Creates an format-specific object file dumper.
 static std::error_code createDumper(const ObjectFile *Obj,
@@ -347,6 +358,8 @@ static std::error_code createDumper(const ObjectFile *Obj,
     return createELFDumper(Obj, Writer, Result);
   if (Obj->isMachO())
     return createMachODumper(Obj, Writer, Result);
+  if (Obj->isWasm())
+    return createWasmDumper(Obj, Writer, Result);
 
   return readobj_error::unsupported_obj_file_format;
 }
@@ -408,6 +421,9 @@ static void dumpObject(const ObjectFile *Obj) {
       if (opts::MipsOptions)
         Dumper->printMipsOptions();
     }
+    if (Obj->getArch() == llvm::Triple::amdgcn)
+      if (opts::AMDGPURuntimeMD)
+        Dumper->printAMDGPURuntimeMD();
     if (opts::SectionGroups)
       Dumper->printGroupSections();
     if (opts::HashHistogram)
@@ -429,7 +445,7 @@ static void dumpObject(const ObjectFile *Obj) {
     if (opts::CodeView)
       Dumper->printCodeViewDebugInfo();
     if (opts::CodeViewMergedTypes)
-      Dumper->mergeCodeViewTypes(CVTypes);
+      Dumper->mergeCodeViewTypes(CVTypes.Builder);
   }
   if (Obj->isMachO()) {
     if (opts::MachODataInCode)
@@ -451,7 +467,7 @@ static void dumpObject(const ObjectFile *Obj) {
 
 /// @brief Dumps each object file in \a Arc;
 static void dumpArchive(const Archive *Arc) {
-  Error Err;
+  Error Err = Error::success();
   for (auto &Child : Arc->children(Err)) {
     Expected<std::unique_ptr<Binary>> ChildOrErr = Child.getAsBinary();
     if (!ChildOrErr) {
@@ -534,7 +550,7 @@ int main(int argc, const char *argv[]) {
 
   if (opts::CodeViewMergedTypes) {
     ScopedPrinter W(outs());
-    dumpCodeViewMergedTypes(W, CVTypes);
+    dumpCodeViewMergedTypes(W, CVTypes.Builder);
   }
 
   return 0;

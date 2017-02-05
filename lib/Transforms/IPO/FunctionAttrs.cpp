@@ -496,6 +496,11 @@ static bool addArgumentReturnedAttrs(const SCCNodeSet &SCCNodes) {
     if (F->getReturnType()->isVoidTy())
       continue;
 
+    // There is nothing to do if an argument is already marked as 'returned'.
+    if (any_of(F->args(),
+               [](const Argument &Arg) { return Arg.hasReturnedAttr(); }))
+      continue;
+
     auto FindRetArg = [&]() -> Value * {
       Value *RetArg = nullptr;
       for (BasicBlock &BB : *F)
@@ -1090,7 +1095,8 @@ namespace {
 struct PostOrderFunctionAttrsLegacyPass : public CallGraphSCCPass {
   static char ID; // Pass identification, replacement for typeid
   PostOrderFunctionAttrsLegacyPass() : CallGraphSCCPass(ID) {
-    initializePostOrderFunctionAttrsLegacyPassPass(*PassRegistry::getPassRegistry());
+    initializePostOrderFunctionAttrsLegacyPassPass(
+        *PassRegistry::getPassRegistry());
   }
 
   bool runOnSCC(CallGraphSCC &SCC) override;
@@ -1112,7 +1118,9 @@ INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
 INITIALIZE_PASS_END(PostOrderFunctionAttrsLegacyPass, "functionattrs",
                     "Deduce function attributes", false, false)
 
-Pass *llvm::createPostOrderFunctionAttrsLegacyPass() { return new PostOrderFunctionAttrsLegacyPass(); }
+Pass *llvm::createPostOrderFunctionAttrsLegacyPass() {
+  return new PostOrderFunctionAttrsLegacyPass();
+}
 
 template <typename AARGetterT>
 static bool runImpl(CallGraphSCC &SCC, AARGetterT AARGetter) {
@@ -1174,7 +1182,8 @@ namespace {
 struct ReversePostOrderFunctionAttrsLegacyPass : public ModulePass {
   static char ID; // Pass identification, replacement for typeid
   ReversePostOrderFunctionAttrsLegacyPass() : ModulePass(ID) {
-    initializeReversePostOrderFunctionAttrsLegacyPassPass(*PassRegistry::getPassRegistry());
+    initializeReversePostOrderFunctionAttrsLegacyPassPass(
+        *PassRegistry::getPassRegistry());
   }
 
   bool runOnModule(Module &M) override;
@@ -1266,16 +1275,9 @@ PreservedAnalyses
 ReversePostOrderFunctionAttrsPass::run(Module &M, ModuleAnalysisManager &AM) {
   auto &CG = AM.getResult<CallGraphAnalysis>(M);
 
-  bool Changed = deduceFunctionAttributeInRPO(M, CG);
-
-  // CallGraphAnalysis holds AssertingVH and must be invalidated eagerly so
-  // that other passes don't delete stuff from under it.
-  // FIXME: We need to invalidate this to avoid PR28400. Is there a better
-  // solution?
-  AM.invalidate<CallGraphAnalysis>(M);
-
-  if (!Changed)
+  if (!deduceFunctionAttributeInRPO(M, CG))
     return PreservedAnalyses::all();
+
   PreservedAnalyses PA;
   PA.preserve<CallGraphAnalysis>();
   return PA;

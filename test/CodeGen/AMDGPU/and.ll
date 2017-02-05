@@ -1,5 +1,5 @@
 ; RUN: llc -march=amdgcn -mcpu=verde -verify-machineinstrs < %s | FileCheck -check-prefix=SI -check-prefix=FUNC %s
-; RUN: llc -march=amdgcn -mcpu=tonga -verify-machineinstrs < %s | FileCheck -check-prefix=SI -check-prefix=FUNC %s
+; RUN: llc -march=amdgcn -mcpu=tonga -mattr=-flat-for-global -verify-machineinstrs < %s | FileCheck -check-prefix=SI -check-prefix=FUNC %s
 ; RUN: llc -march=r600 -mcpu=redwood < %s | FileCheck -check-prefix=EG -check-prefix=FUNC %s
 
 declare i32 @llvm.r600.read.tidig.x() #0
@@ -320,6 +320,20 @@ define void @v_and_i64_32_bit_constant(i64 addrspace(1)* %out, i64 addrspace(1)*
 define void @v_and_inline_imm_i64(i64 addrspace(1)* %out, i64 addrspace(1)* %aptr) {
   %a = load i64, i64 addrspace(1)* %aptr, align 8
   %and = and i64 %a, 64
+  store i64 %and, i64 addrspace(1)* %out, align 8
+  ret void
+}
+
+; FIXME: Should be able to reduce load width
+; FUNC-LABEL: {{^}}v_and_inline_neg_imm_i64:
+; SI: buffer_load_dwordx2 v{{\[}}[[VAL_LO:[0-9]+]]:[[VAL_HI:[0-9]+]]{{\]}}
+; SI-NOT: and
+; SI: v_and_b32_e32 v[[VAL_LO]], -8, v[[VAL_LO]]
+; SI-NOT: and
+; SI: buffer_store_dwordx2 v{{\[}}[[VAL_LO]]:[[VAL_HI]]{{\]}}
+define void @v_and_inline_neg_imm_i64(i64 addrspace(1)* %out, i64 addrspace(1)* %aptr) {
+  %a = load i64, i64 addrspace(1)* %aptr, align 8
+  %and = and i64 %a, -8
   store i64 %and, i64 addrspace(1)* %out, align 8
   ret void
 }

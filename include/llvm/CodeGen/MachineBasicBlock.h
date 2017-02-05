@@ -19,6 +19,7 @@
 #include "llvm/CodeGen/MachineInstrBundleIterator.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/Support/BranchProbability.h"
+#include "llvm/MC/LaneBitmask.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Support/DataTypes.h"
 #include <functional>
@@ -35,23 +36,21 @@ class StringRef;
 class raw_ostream;
 class MachineBranchProbabilityInfo;
 
-// Forward declaration to avoid circular include problem with TargetRegisterInfo
-typedef unsigned LaneBitmask;
-
 template <> struct ilist_traits<MachineInstr> {
 private:
   friend class MachineBasicBlock; // Set by the owning MachineBasicBlock.
   MachineBasicBlock *Parent;
 
+  typedef simple_ilist<MachineInstr, ilist_sentinel_tracking<true>>::iterator
+      instr_iterator;
+
 public:
   void addNodeToList(MachineInstr *N);
   void removeNodeFromList(MachineInstr *N);
-  void transferNodesFromList(ilist_traits &OldList,
-                             simple_ilist<MachineInstr>::iterator First,
-                             simple_ilist<MachineInstr>::iterator Last);
+  void transferNodesFromList(ilist_traits &OldList, instr_iterator First,
+                             instr_iterator Last);
 
   void deleteNode(MachineInstr *MI);
-  // Leave out createNode...
 };
 
 class MachineBasicBlock
@@ -70,7 +69,7 @@ public:
   };
 
 private:
-  typedef ilist<MachineInstr> Instructions;
+  typedef ilist<MachineInstr, ilist_sentinel_tracking<true>> Instructions;
   Instructions Insts;
   const BasicBlock *BB;
   int Number;
@@ -153,9 +152,9 @@ public:
 
   typedef MachineInstrBundleIterator<MachineInstr> iterator;
   typedef MachineInstrBundleIterator<const MachineInstr> const_iterator;
-  typedef std::reverse_iterator<const_iterator>          const_reverse_iterator;
-  typedef std::reverse_iterator<iterator>                      reverse_iterator;
-
+  typedef MachineInstrBundleIterator<MachineInstr, true> reverse_iterator;
+  typedef MachineInstrBundleIterator<const MachineInstr, true>
+      const_reverse_iterator;
 
   unsigned size() const { return (unsigned)Insts.size(); }
   bool empty() const { return Insts.empty(); }
@@ -190,13 +189,15 @@ public:
   const_iterator          begin() const { return instr_begin();  }
   iterator                end  ()       { return instr_end();    }
   const_iterator          end  () const { return instr_end();    }
-  reverse_iterator rbegin() { return reverse_iterator(end()); }
-  const_reverse_iterator rbegin() const {
-    return const_reverse_iterator(end());
+  reverse_iterator rbegin() {
+    return reverse_iterator::getAtBundleBegin(instr_rbegin());
   }
-  reverse_iterator rend() { return reverse_iterator(begin()); }
+  const_reverse_iterator rbegin() const {
+    return const_reverse_iterator::getAtBundleBegin(instr_rbegin());
+  }
+  reverse_iterator rend() { return reverse_iterator(instr_rend()); }
   const_reverse_iterator rend() const {
-    return const_reverse_iterator(begin());
+    return const_reverse_iterator(instr_rend());
   }
 
   /// Support for MachineInstr::getNextNode().
@@ -275,7 +276,8 @@ public:
   /// Adds the specified register as a live in. Note that it is an error to add
   /// the same register to the same set more than once unless the intention is
   /// to call sortUniqueLiveIns after all registers are added.
-  void addLiveIn(MCPhysReg PhysReg, LaneBitmask LaneMask = ~0u) {
+  void addLiveIn(MCPhysReg PhysReg,
+                 LaneBitmask LaneMask = LaneBitmask::getAll()) {
     LiveIns.push_back(RegisterMaskPair(PhysReg, LaneMask));
   }
   void addLiveIn(const RegisterMaskPair &RegMaskPair) {
@@ -287,21 +289,36 @@ public:
   /// LiveIn insertion.
   void sortUniqueLiveIns();
 
+  /// Clear live in list.
+  void clearLiveIns();
+
   /// Add PhysReg as live in to this block, and ensure that there is a copy of
   /// PhysReg to a virtual register of class RC. Return the virtual register
   /// that is a copy of the live in PhysReg.
   unsigned addLiveIn(MCPhysReg PhysReg, const TargetRegisterClass *RC);
 
   /// Remove the specified register from the live in set.
-  void removeLiveIn(MCPhysReg Reg, LaneBitmask LaneMask = ~0u);
+  void removeLiveIn(MCPhysReg Reg,
+                    LaneBitmask LaneMask = LaneBitmask::getAll());
 
   /// Return true if the specified register is in the live in set.
-  bool isLiveIn(MCPhysReg Reg, LaneBitmask LaneMask = ~0u) const;
+  bool isLiveIn(MCPhysReg Reg,
+                LaneBitmask LaneMask = LaneBitmask::getAll()) const;
 
   // Iteration support for live in sets.  These sets are kept in sorted
   // order by their register number.
   typedef LiveInVector::const_iterator livein_iterator;
-  livein_iterator livein_begin() const { return LiveIns.begin(); }
+#ifndef NDEBUG
+  /// Unlike livein_begin, this method does not check that the liveness
+  /// information is accurate. Still for debug purposes it may be useful
+  /// to have iterators that won't assert if the liveness information
+  /// is not current.
+  livein_iterator livein_begin_dbg() const { return LiveIns.begin(); }
+  iterator_range<livein_iterator> liveins_dbg() const {
+    return make_range(livein_begin_dbg(), livein_end());
+  }
+#endif
+  livein_iterator livein_begin() const;
   livein_iterator livein_end()   const { return LiveIns.end(); }
   bool            livein_empty() const { return LiveIns.empty(); }
   iterator_range<livein_iterator> liveins() const {
@@ -452,9 +469,14 @@ public:
   iterator getFirstNonPHI();
 
   /// Return the first instruction in MBB after I that is not a PHI or a label.
-  /// This is the correct point to insert copies at the beginning of a basic
-  /// block.
+  /// This is the correct point to insert lowered copies at the beginning of a
+  /// basic block that must be before any debugging information.
   iterator SkipPHIsAndLabels(iterator I);
+
+  /// Return the first instruction in MBB after I that is not a PHI, label or
+  /// debug.  This is the correct point to insert copies at the beginning of a
+  /// basic block.
+  iterator SkipPHIsLabelsAndDebug(iterator I);
 
   /// Returns an iterator to the first terminator instruction of this basic
   /// block. If a terminator does not exist, it returns end().
@@ -796,6 +818,28 @@ public:
 
   MachineBasicBlock::iterator getInitial() { return I; }
 };
+
+/// Increment \p It until it points to a non-debug instruction or to \p End
+/// and return the resulting iterator. This function should only be used
+/// MachineBasicBlock::{iterator, const_iterator, instr_iterator,
+/// const_instr_iterator} and the respective reverse iterators.
+template<typename IterT>
+inline IterT skipDebugInstructionsForward(IterT It, IterT End) {
+  while (It != End && It->isDebugValue())
+    It++;
+  return It;
+}
+
+/// Decrement \p It until it points to a non-debug instruction or to \p Begin
+/// and return the resulting iterator. This function should only be used
+/// MachineBasicBlock::{iterator, const_iterator, instr_iterator,
+/// const_instr_iterator} and the respective reverse iterators.
+template<class IterT>
+inline IterT skipDebugInstructionsBackward(IterT It, IterT Begin) {
+  while (It != Begin && It->isDebugValue())
+    It--;
+  return It;
+}
 
 } // End llvm namespace
 

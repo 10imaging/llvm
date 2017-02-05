@@ -12,20 +12,25 @@
 #include "PdbYaml.h"
 #include "llvm-pdbdump.h"
 
-#include "llvm/DebugInfo/PDB/Raw/DbiStream.h"
-#include "llvm/DebugInfo/PDB/Raw/InfoStream.h"
-#include "llvm/DebugInfo/PDB/Raw/PDBFile.h"
-#include "llvm/DebugInfo/PDB/Raw/RawConstants.h"
-#include "llvm/DebugInfo/PDB/Raw/TpiStream.h"
+#include "llvm/DebugInfo/MSF/MappedBlockStream.h"
+#include "llvm/DebugInfo/PDB/Native/DbiStream.h"
+#include "llvm/DebugInfo/PDB/Native/InfoStream.h"
+#include "llvm/DebugInfo/PDB/Native/ModStream.h"
+#include "llvm/DebugInfo/PDB/Native/PDBFile.h"
+#include "llvm/DebugInfo/PDB/Native/RawConstants.h"
+#include "llvm/DebugInfo/PDB/Native/TpiStream.h"
 
 using namespace llvm;
 using namespace llvm::pdb;
 
-YAMLOutputStyle::YAMLOutputStyle(PDBFile &File) : File(File), Out(outs()) {}
+YAMLOutputStyle::YAMLOutputStyle(PDBFile &File)
+    : File(File), Out(outs()), Obj(File.getAllocator()) {}
 
 Error YAMLOutputStyle::dump() {
   if (opts::pdb2yaml::StreamDirectory)
     opts::pdb2yaml::StreamMetadata = true;
+  if (opts::pdb2yaml::DbiModuleSyms)
+    opts::pdb2yaml::DbiModuleInfo = true;
   if (opts::pdb2yaml::DbiModuleSourceFileInfo)
     opts::pdb2yaml::DbiModuleInfo = true;
   if (opts::pdb2yaml::DbiModuleInfo)
@@ -40,6 +45,9 @@ Error YAMLOutputStyle::dump() {
   if (auto EC = dumpStreamDirectory())
     return EC;
 
+  if (auto EC = dumpStringTable())
+    return EC;
+
   if (auto EC = dumpPDBStream())
     return EC;
 
@@ -47,6 +55,9 @@ Error YAMLOutputStyle::dump() {
     return EC;
 
   if (auto EC = dumpTpiStream())
+    return EC;
+
+  if (auto EC = dumpIpiStream())
     return EC;
 
   flush();
@@ -72,6 +83,24 @@ Error YAMLOutputStyle::dumpFileHeaders() {
   Obj.Headers->SuperBlock.Unknown1 = File.getUnknown1();
   Obj.Headers->FileSize = File.getFileSize();
 
+  return Error::success();
+}
+
+Error YAMLOutputStyle::dumpStringTable() {
+  if (!opts::pdb2yaml::StringTable)
+    return Error::success();
+
+  Obj.StringTable.emplace();
+  auto ExpectedST = File.getStringTable();
+  if (!ExpectedST)
+    return ExpectedST.takeError();
+
+  const auto &ST = ExpectedST.get();
+  for (auto ID : ST.name_ids()) {
+    StringRef S = ST.getStringForID(ID);
+    if (!S.empty())
+      Obj.StringTable->push_back(S);
+  }
   return Error::success();
 }
 
@@ -114,12 +143,6 @@ Error YAMLOutputStyle::dumpPDBStream() {
   Obj.PdbStream->Guid = InfoS.getGuid();
   Obj.PdbStream->Signature = InfoS.getSignature();
   Obj.PdbStream->Version = InfoS.getVersion();
-  for (auto &NS : InfoS.named_streams()) {
-    yaml::NamedStreamMapping Mapping;
-    Mapping.StreamName = NS.getKey();
-    Mapping.StreamNumber = NS.getValue();
-    Obj.PdbStream->NamedStreams.push_back(Mapping);
-  }
 
   return Error::success();
 }
@@ -148,6 +171,25 @@ Error YAMLOutputStyle::dumpDbiStream() {
       DMI.Obj = MI.Info.getObjFileName();
       if (opts::pdb2yaml::DbiModuleSourceFileInfo)
         DMI.SourceFiles = MI.SourceFiles;
+
+      if (opts::pdb2yaml::DbiModuleSyms &&
+          MI.Info.getModuleStreamIndex() != kInvalidStreamIndex) {
+        DMI.Modi.emplace();
+        auto ModStreamData = msf::MappedBlockStream::createIndexedStream(
+            File.getMsfLayout(), File.getMsfBuffer(),
+            MI.Info.getModuleStreamIndex());
+
+        pdb::ModStream ModS(MI.Info, std::move(ModStreamData));
+        if (auto EC = ModS.reload())
+          return EC;
+
+        DMI.Modi->Signature = ModS.signature();
+        bool HadError = false;
+        for (auto &Sym : ModS.symbols(&HadError)) {
+          pdb::yaml::PdbSymbolRecord Record{Sym};
+          DMI.Modi->Symbols.push_back(Record);
+        }
+      }
       Obj.DbiStream->ModInfos.push_back(DMI);
     }
   }
@@ -173,6 +215,26 @@ Error YAMLOutputStyle::dumpTpiStream() {
     // is owned by the backing stream.
     R.Record = Record;
     Obj.TpiStream->Records.push_back(R);
+  }
+
+  return Error::success();
+}
+
+Error YAMLOutputStyle::dumpIpiStream() {
+  if (!opts::pdb2yaml::IpiStream)
+    return Error::success();
+
+  auto IpiS = File.getPDBIpiStream();
+  if (!IpiS)
+    return IpiS.takeError();
+
+  auto &IS = IpiS.get();
+  Obj.IpiStream.emplace();
+  Obj.IpiStream->Version = IS.getTpiVersion();
+  for (auto &Record : IS.types(nullptr)) {
+    yaml::PdbTpiRecord R;
+    R.Record = Record;
+    Obj.IpiStream->Records.push_back(R);
   }
 
   return Error::success();

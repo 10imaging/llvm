@@ -85,6 +85,7 @@ MCSection::getSubsectionInsertionPoint(unsigned Subsection) {
   return IP;
 }
 
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
 LLVM_DUMP_METHOD void MCSection::dump() {
   raw_ostream &OS = llvm::errs();
 
@@ -97,11 +98,4 @@ LLVM_DUMP_METHOD void MCSection::dump() {
   }
   OS << "]>";
 }
-
-MCSection::iterator MCSection::begin() { return Fragments.begin(); }
-
-MCSection::iterator MCSection::end() { return Fragments.end(); }
-
-MCSection::reverse_iterator MCSection::rbegin() { return Fragments.rbegin(); }
-
-MCSection::reverse_iterator MCSection::rend() { return Fragments.rend(); }
+#endif

@@ -15,21 +15,29 @@
 #ifndef LLVM_IR_DIBUILDER_H
 #define LLVM_IR_DIBUILDER_H
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/None.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/TrackingMDRef.h"
-#include "llvm/IR/ValueHandle.h"
-#include "llvm/Support/DataTypes.h"
+#include "llvm/Support/Casting.h"
+#include <algorithm>
+#include <cstdint>
 
 namespace llvm {
+
   class BasicBlock;
-  class Instruction;
+  class Constant;
   class Function;
+  class Instruction;
+  class LLVMContext;
   class Module;
   class Value;
-  class Constant;
-  class LLVMContext;
-  class StringRef;
-  template <typename T> class ArrayRef;
 
   class DIBuilder {
     Module &M;
@@ -45,6 +53,10 @@ namespace llvm {
     SmallVector<Metadata *, 4> AllSubprograms;
     SmallVector<Metadata *, 4> AllGVs;
     SmallVector<TrackingMDNodeRef, 4> AllImportedModules;
+    /// Map Macro parent (which can be DIMacroFile or nullptr) to a list of
+    /// Metadata all of type DIMacroNode.
+    /// DIMacroNode's with nullptr parent are DICompileUnit direct children.
+    MapVector<MDNode *, SetVector<Metadata *>> AllMacrosPerParent;
 
     /// Track nodes that may be unresolved.
     SmallVector<TrackingMDNodeRef, 4> UnresolvedNodes;
@@ -57,9 +69,6 @@ namespace llvm {
     /// copy.
     DenseMap<MDNode *, SmallVector<TrackingMDNodeRef, 1>> PreservedVariables;
 
-    DIBuilder(const DIBuilder &) = delete;
-    void operator=(const DIBuilder &) = delete;
-
     /// Create a temporary.
     ///
     /// Create an \a temporary node and track it in \a UnresolvedNodes.
@@ -71,6 +80,8 @@ namespace llvm {
     /// If \c AllowUnresolved, collect unresolved nodes attached to the module
     /// in order to resolve cycles during \a finalize().
     explicit DIBuilder(Module &M, bool AllowUnresolved = true);
+    DIBuilder(const DIBuilder &) = delete;
+    DIBuilder &operator=(const DIBuilder &) = delete;
 
     /// Construct any deferred debug info descriptors.
     void finalize();
@@ -78,8 +89,7 @@ namespace llvm {
     /// A CompileUnit provides an anchor for all debugging
     /// information generated during this instance of compilation.
     /// \param Lang          Source programming language, eg. dwarf::DW_LANG_C99
-    /// \param File          File name
-    /// \param Dir           Directory
+    /// \param File          File info.
     /// \param Producer      Identify the producer of debugging information
     ///                      and code.  Usually this is a compiler
     ///                      version string.
@@ -95,17 +105,44 @@ namespace llvm {
     ///                      out into.
     /// \param Kind          The kind of debug information to generate.
     /// \param DWOId         The DWOId if this is a split skeleton compile unit.
+    /// \param SplitDebugInlining    Whether to emit inline debug info.
+    /// \param DebugInfoForProfiling Whether to emit extra debug info for
+    ///                              profile collection.
     DICompileUnit *
-    createCompileUnit(unsigned Lang, StringRef File, StringRef Dir,
-                      StringRef Producer, bool isOptimized, StringRef Flags,
-                      unsigned RV, StringRef SplitName = StringRef(),
+    createCompileUnit(unsigned Lang, DIFile *File, StringRef Producer,
+                      bool isOptimized, StringRef Flags, unsigned RV,
+                      StringRef SplitName = StringRef(),
                       DICompileUnit::DebugEmissionKind Kind =
                           DICompileUnit::DebugEmissionKind::FullDebug,
-                      uint64_t DWOId = 0, bool SplitDebugInlining = true);
+                      uint64_t DWOId = 0, bool SplitDebugInlining = true,
+                      bool DebugInfoForProfiling = false);
 
-    /// Create a file descriptor to hold debugging information
-    /// for a file.
-    DIFile *createFile(StringRef Filename, StringRef Directory);
+    /// Create a file descriptor to hold debugging information for a file.
+    /// \param Filename  File name.
+    /// \param Directory Directory.
+    /// \param CSKind    Checksum kind (e.g. CSK_None, CSK_MD5, CSK_SHA1, etc.).
+    /// \param Checksum  Checksum data.
+    DIFile *createFile(StringRef Filename, StringRef Directory,
+                       DIFile::ChecksumKind CSKind = DIFile::CSK_None,
+                       StringRef Checksum = StringRef());
+
+    /// Create debugging information entry for a macro.
+    /// \param Parent     Macro parent (could be nullptr).
+    /// \param Line       Source line number where the macro is defined.
+    /// \param MacroType  DW_MACINFO_define or DW_MACINFO_undef.
+    /// \param Name       Macro name.
+    /// \param Value      Macro value.
+    DIMacro *createMacro(DIMacroFile *Parent, unsigned Line, unsigned MacroType,
+                         StringRef Name, StringRef Value = StringRef());
+
+    /// Create debugging information temporary entry for a macro file.
+    /// List of macro node direct children will be calculated by DIBuilder,
+    /// using the \p Parent relationship.
+    /// \param Parent     Macro file parent (could be nullptr).
+    /// \param Line       Source line number where the macro file is included.
+    /// \param File       File descriptor containing the name of the macro file.
+    DIMacroFile *createTempMacroFile(DIMacroFile *Parent, unsigned Line,
+                                     DIFile *File);
 
     /// Create a single enumerator value.
     DIEnumerator *createEnumerator(StringRef Name, int64_t Val);
@@ -120,10 +157,9 @@ namespace llvm {
     /// type.
     /// \param Name        Type name.
     /// \param SizeInBits  Size of the type.
-    /// \param AlignInBits Type alignment.
     /// \param Encoding    DWARF encoding code, e.g. dwarf::DW_ATE_float.
     DIBasicType *createBasicType(StringRef Name, uint64_t SizeInBits,
-                                 uint64_t AlignInBits, unsigned Encoding);
+                                 unsigned Encoding);
 
     /// Create debugging information entry for a qualified
     /// type, e.g. 'const int'.
@@ -137,7 +173,7 @@ namespace llvm {
     /// \param AlignInBits Alignment. (optional)
     /// \param Name        Pointer type name. (optional)
     DIDerivedType *createPointerType(DIType *PointeeTy, uint64_t SizeInBits,
-                                     uint64_t AlignInBits = 0,
+                                     uint32_t AlignInBits = 0,
                                      StringRef Name = "");
 
     /// Create debugging information entry for a pointer to member.
@@ -145,16 +181,16 @@ namespace llvm {
     /// \param SizeInBits  Size.
     /// \param AlignInBits Alignment. (optional)
     /// \param Class Type for which this pointer points to members of.
-    DIDerivedType *createMemberPointerType(DIType *PointeeTy, DIType *Class,
-                                           uint64_t SizeInBits,
-                                           uint64_t AlignInBits = 0,
-                                           DINode::DIFlags Flags = DINode::FlagZero);
+    DIDerivedType *
+    createMemberPointerType(DIType *PointeeTy, DIType *Class,
+                            uint64_t SizeInBits, uint32_t AlignInBits = 0,
+                            DINode::DIFlags Flags = DINode::FlagZero);
 
     /// Create debugging information entry for a c++
     /// style reference or rvalue reference type.
     DIDerivedType *createReferenceType(unsigned Tag, DIType *RTy,
                                        uint64_t SizeInBits = 0,
-                                       uint64_t AlignInBits = 0);
+                                       uint32_t AlignInBits = 0);
 
     /// Create debugging information entry for a typedef.
     /// \param Ty          Original type.
@@ -191,10 +227,10 @@ namespace llvm {
     /// \param Ty           Parent type.
     DIDerivedType *createMemberType(DIScope *Scope, StringRef Name,
                                     DIFile *File, unsigned LineNo,
-                                    uint64_t SizeInBits, uint64_t AlignInBits,
+                                    uint64_t SizeInBits,
+                                    uint32_t AlignInBits,
                                     uint64_t OffsetInBits,
-                                    DINode::DIFlags Flags,
-                                    DIType *Ty);
+                                    DINode::DIFlags Flags, DIType *Ty);
 
     /// Create debugging information entry for a bit field member.
     /// \param Scope               Member scope.
@@ -202,14 +238,13 @@ namespace llvm {
     /// \param File                File where this member is defined.
     /// \param LineNo              Line number.
     /// \param SizeInBits          Member size.
-    /// \param AlignInBits         Member alignment.
     /// \param OffsetInBits        Member offset.
     /// \param StorageOffsetInBits Member storage offset.
     /// \param Flags               Flags to encode member attribute.
     /// \param Ty                  Parent type.
     DIDerivedType *createBitFieldMemberType(
         DIScope *Scope, StringRef Name, DIFile *File, unsigned LineNo,
-        uint64_t SizeInBits, uint64_t AlignInBits, uint64_t OffsetInBits,
+        uint64_t SizeInBits, uint64_t OffsetInBits,
         uint64_t StorageOffsetInBits, DINode::DIFlags Flags, DIType *Ty);
 
     /// Create debugging information entry for a
@@ -221,10 +256,12 @@ namespace llvm {
     /// \param Ty         Type of the static member.
     /// \param Flags      Flags to encode member attribute, e.g. private.
     /// \param Val        Const initializer of the member.
+    /// \param AlignInBits  Member alignment.
     DIDerivedType *createStaticMemberType(DIScope *Scope, StringRef Name,
                                           DIFile *File, unsigned LineNo,
                                           DIType *Ty, DINode::DIFlags Flags,
-                                          llvm::Constant *Val);
+                                          Constant *Val,
+                                          uint32_t AlignInBits = 0);
 
     /// Create debugging information entry for Objective-C
     /// instance variable.
@@ -238,7 +275,7 @@ namespace llvm {
     /// \param Ty           Parent type.
     /// \param PropertyNode Property associated with this ivar.
     DIDerivedType *createObjCIVar(StringRef Name, DIFile *File, unsigned LineNo,
-                                  uint64_t SizeInBits, uint64_t AlignInBits,
+                                  uint64_t SizeInBits, uint32_t AlignInBits,
                                   uint64_t OffsetInBits, DINode::DIFlags Flags,
                                   DIType *Ty, MDNode *PropertyNode);
 
@@ -273,15 +310,12 @@ namespace llvm {
     ///                     for more info.
     /// \param TemplateParms Template type parameters.
     /// \param UniqueIdentifier A unique identifier for the class.
-    DICompositeType *createClassType(DIScope *Scope, StringRef Name,
-                                     DIFile *File, unsigned LineNumber,
-                                     uint64_t SizeInBits, uint64_t AlignInBits,
-                                     uint64_t OffsetInBits,
-                                     DINode::DIFlags Flags,
-                                     DIType *DerivedFrom, DINodeArray Elements,
-                                     DIType *VTableHolder = nullptr,
-                                     MDNode *TemplateParms = nullptr,
-                                     StringRef UniqueIdentifier = "");
+    DICompositeType *createClassType(
+        DIScope *Scope, StringRef Name, DIFile *File, unsigned LineNumber,
+        uint64_t SizeInBits, uint32_t AlignInBits, uint64_t OffsetInBits,
+        DINode::DIFlags Flags, DIType *DerivedFrom, DINodeArray Elements,
+        DIType *VTableHolder = nullptr, MDNode *TemplateParms = nullptr,
+        StringRef UniqueIdentifier = "");
 
     /// Create debugging information entry for a struct.
     /// \param Scope        Scope in which this struct is defined.
@@ -296,7 +330,7 @@ namespace llvm {
     /// \param UniqueIdentifier A unique identifier for the struct.
     DICompositeType *createStructType(
         DIScope *Scope, StringRef Name, DIFile *File, unsigned LineNumber,
-        uint64_t SizeInBits, uint64_t AlignInBits, DINode::DIFlags Flags,
+        uint64_t SizeInBits, uint32_t AlignInBits, DINode::DIFlags Flags,
         DIType *DerivedFrom, DINodeArray Elements, unsigned RunTimeLang = 0,
         DIType *VTableHolder = nullptr, StringRef UniqueIdentifier = "");
 
@@ -313,7 +347,7 @@ namespace llvm {
     /// \param UniqueIdentifier A unique identifier for the union.
     DICompositeType *createUnionType(DIScope *Scope, StringRef Name,
                                      DIFile *File, unsigned LineNumber,
-                                     uint64_t SizeInBits, uint64_t AlignInBits,
+                                     uint64_t SizeInBits, uint32_t AlignInBits,
                                      DINode::DIFlags Flags,
                                      DINodeArray Elements,
                                      unsigned RunTimeLang = 0,
@@ -363,7 +397,7 @@ namespace llvm {
     /// \param AlignInBits  Alignment.
     /// \param Ty           Element type.
     /// \param Subscripts   Subscripts.
-    DICompositeType *createArrayType(uint64_t Size, uint64_t AlignInBits,
+    DICompositeType *createArrayType(uint64_t Size, uint32_t AlignInBits,
                                      DIType *Ty, DINodeArray Subscripts);
 
     /// Create debugging information entry for a vector type.
@@ -371,7 +405,7 @@ namespace llvm {
     /// \param AlignInBits  Alignment.
     /// \param Ty           Element type.
     /// \param Subscripts   Subscripts.
-    DICompositeType *createVectorType(uint64_t Size, uint64_t AlignInBits,
+    DICompositeType *createVectorType(uint64_t Size, uint32_t AlignInBits,
                                       DIType *Ty, DINodeArray Subscripts);
 
     /// Create debugging information entry for an
@@ -387,7 +421,7 @@ namespace llvm {
     /// \param UniqueIdentifier A unique identifier for the enum.
     DICompositeType *createEnumerationType(
         DIScope *Scope, StringRef Name, DIFile *File, unsigned LineNumber,
-        uint64_t SizeInBits, uint64_t AlignInBits, DINodeArray Elements,
+        uint64_t SizeInBits, uint32_t AlignInBits, DINodeArray Elements,
         DIType *UnderlyingType, StringRef UniqueIdentifier = "");
 
     /// Create subroutine type.
@@ -396,9 +430,10 @@ namespace llvm {
     /// \param Flags           E.g.: LValueReference.
     ///                        These flags are used to emit dwarf attributes.
     /// \param CC              Calling convention, e.g. dwarf::DW_CC_normal
-    DISubroutineType *createSubroutineType(DITypeRefArray ParameterTypes,
-                                           DINode::DIFlags Flags = DINode::FlagZero,
-                                           unsigned CC = 0);
+    DISubroutineType *
+    createSubroutineType(DITypeRefArray ParameterTypes,
+                         DINode::DIFlags Flags = DINode::FlagZero,
+                         unsigned CC = 0);
 
     /// Create an external type reference.
     /// \param Tag              Dwarf TAG.
@@ -419,14 +454,14 @@ namespace llvm {
                                        DIScope *Scope, DIFile *F, unsigned Line,
                                        unsigned RuntimeLang = 0,
                                        uint64_t SizeInBits = 0,
-                                       uint64_t AlignInBits = 0,
+                                       uint32_t AlignInBits = 0,
                                        StringRef UniqueIdentifier = "");
 
     /// Create a temporary forward-declared type.
     DICompositeType *createReplaceableCompositeType(
         unsigned Tag, StringRef Name, DIScope *Scope, DIFile *F, unsigned Line,
         unsigned RuntimeLang = 0, uint64_t SizeInBits = 0,
-        uint64_t AlignInBits = 0, DINode::DIFlags Flags = DINode::FlagFwdDecl,
+        uint32_t AlignInBits = 0, DINode::DIFlags Flags = DINode::FlagFwdDecl,
         StringRef UniqueIdentifier = "");
 
     /// Retain DIScope* in a module even if it is not referenced
@@ -440,6 +475,9 @@ namespace llvm {
     /// Get a DINodeArray, create one if required.
     DINodeArray getOrCreateArray(ArrayRef<Metadata *> Elements);
 
+    /// Get a DIMacroNodeArray, create one if required.
+    DIMacroNodeArray getOrCreateMacroArray(ArrayRef<Metadata *> Elements);
+
     /// Get a DITypeRefArray, create one if required.
     DITypeRefArray getOrCreateTypeArray(ArrayRef<Metadata *> Elements);
 
@@ -447,8 +485,7 @@ namespace llvm {
     /// implicitly uniques the values returned.
     DISubrange *getOrCreateSubrange(int64_t Lo, int64_t Count);
 
-    /// Create a new descriptor for the specified
-    /// variable.
+    /// Create a new descriptor for the specified variable.
     /// \param Context     Variable scope.
     /// \param Name        Name of the variable.
     /// \param LinkageName Mangled  name of the variable.
@@ -457,21 +494,23 @@ namespace llvm {
     /// \param Ty          Variable Type.
     /// \param isLocalToUnit Boolean flag indicate whether this variable is
     ///                      externally visible or not.
-    /// \param Val         llvm::Value of the variable.
+    /// \param Expr        The location of the global relative to the attached
+    ///                    GlobalVariable.
     /// \param Decl        Reference to the corresponding declaration.
-    DIGlobalVariable *createGlobalVariable(DIScope *Context, StringRef Name,
-                                           StringRef LinkageName, DIFile *File,
-                                           unsigned LineNo, DIType *Ty,
-                                           bool isLocalToUnit,
-                                           llvm::Constant *Val,
-                                           MDNode *Decl = nullptr);
+    /// \param AlignInBits Variable alignment(or 0 if no alignment attr was
+    ///                    specified)
+    DIGlobalVariableExpression *createGlobalVariableExpression(
+        DIScope *Context, StringRef Name, StringRef LinkageName, DIFile *File,
+        unsigned LineNo, DIType *Ty, bool isLocalToUnit,
+        DIExpression *Expr = nullptr, MDNode *Decl = nullptr,
+        uint32_t AlignInBits = 0);
 
     /// Identical to createGlobalVariable
     /// except that the resulting DbgNode is temporary and meant to be RAUWed.
     DIGlobalVariable *createTempGlobalVariableFwdDecl(
         DIScope *Context, StringRef Name, StringRef LinkageName, DIFile *File,
-        unsigned LineNo, DIType *Ty, bool isLocalToUnit, llvm::Constant *Val,
-        MDNode *Decl = nullptr);
+        unsigned LineNo, DIType *Ty, bool isLocalToUnit, MDNode *Decl = nullptr,
+        uint32_t AlignInBits = 0);
 
     /// Create a new descriptor for an auto variable.  This is a local variable
     /// that is not a subprogram parameter.
@@ -481,11 +520,11 @@ namespace llvm {
     ///
     /// If \c AlwaysPreserve, this variable will be referenced from its
     /// containing subprogram, and will survive some optimizations.
-    DILocalVariable *createAutoVariable(DIScope *Scope, StringRef Name,
-                                         DIFile *File, unsigned LineNo,
-                                         DIType *Ty,
-                                         bool AlwaysPreserve = false,
-                                         DINode::DIFlags Flags = DINode::FlagZero);
+    DILocalVariable *
+    createAutoVariable(DIScope *Scope, StringRef Name, DIFile *File,
+                       unsigned LineNo, DIType *Ty, bool AlwaysPreserve = false,
+                       DINode::DIFlags Flags = DINode::FlagZero,
+                       uint32_t AlignInBits = 0);
 
     /// Create a new descriptor for a parameter variable.
     ///
@@ -498,11 +537,11 @@ namespace llvm {
     ///
     /// If \c AlwaysPreserve, this variable will be referenced from its
     /// containing subprogram, and will survive some optimizations.
-    DILocalVariable *createParameterVariable(DIScope *Scope, StringRef Name,
-                                             unsigned ArgNo, DIFile *File,
-                                             unsigned LineNo, DIType *Ty,
-                                             bool AlwaysPreserve = false,
-                                             DINode::DIFlags Flags = DINode::FlagZero);
+    DILocalVariable *
+    createParameterVariable(DIScope *Scope, StringRef Name, unsigned ArgNo,
+                            DIFile *File, unsigned LineNo, DIType *Ty,
+                            bool AlwaysPreserve = false,
+                            DINode::DIFlags Flags = DINode::FlagZero);
 
     /// Create a new descriptor for the specified
     /// variable which has a complex address expression for its address.
@@ -515,8 +554,15 @@ namespace llvm {
     ///
     /// \param OffsetInBits Offset of the piece in bits.
     /// \param SizeInBits   Size of the piece in bits.
-    DIExpression *createBitPieceExpression(unsigned OffsetInBits,
+    DIExpression *createFragmentExpression(unsigned OffsetInBits,
                                            unsigned SizeInBits);
+
+    /// Create an expression for a variable that does not have an address, but
+    /// does have a constant value.
+    DIExpression *createConstantValueExpression(uint64_t Val) {
+      return DIExpression::get(
+          VMContext, {dwarf::DW_OP_constu, Val, dwarf::DW_OP_stack_value});
+    }
 
     /// Create a new descriptor for the specified subprogram.
     /// See comments in DISubprogram* for descriptions of these fields.
@@ -549,8 +595,8 @@ namespace llvm {
         DIScope *Scope, StringRef Name, StringRef LinkageName, DIFile *File,
         unsigned LineNo, DISubroutineType *Ty, bool isLocalToUnit,
         bool isDefinition, unsigned ScopeLine,
-        DINode::DIFlags Flags = DINode::FlagZero,
-        bool isOptimized = false, DITemplateParameterArray TParams = nullptr,
+        DINode::DIFlags Flags = DINode::FlagZero, bool isOptimized = false,
+        DITemplateParameterArray TParams = nullptr,
         DISubprogram *Decl = nullptr);
 
     /// Create a new descriptor for the specified C++ method.
@@ -575,15 +621,13 @@ namespace llvm {
     ///                      This flags are used to emit dwarf attributes.
     /// \param isOptimized   True if optimization is ON.
     /// \param TParams       Function template parameters.
-    DISubprogram *
-    createMethod(DIScope *Scope, StringRef Name, StringRef LinkageName,
-                 DIFile *File, unsigned LineNo, DISubroutineType *Ty,
-                 bool isLocalToUnit, bool isDefinition, unsigned Virtuality = 0,
-                 unsigned VTableIndex = 0, int ThisAdjustment = 0,
-                 DIType *VTableHolder = nullptr,
-                 DINode::DIFlags Flags = DINode::FlagZero,
-                 bool isOptimized = false,
-                 DITemplateParameterArray TParams = nullptr);
+    DISubprogram *createMethod(
+        DIScope *Scope, StringRef Name, StringRef LinkageName, DIFile *File,
+        unsigned LineNo, DISubroutineType *Ty, bool isLocalToUnit,
+        bool isDefinition, unsigned Virtuality = 0, unsigned VTableIndex = 0,
+        int ThisAdjustment = 0, DIType *VTableHolder = nullptr,
+        DINode::DIFlags Flags = DINode::FlagZero, bool isOptimized = false,
+        DITemplateParameterArray TParams = nullptr);
 
     /// This creates new descriptor for a namespace with the specified
     /// parent scope.
@@ -591,8 +635,9 @@ namespace llvm {
     /// \param Name        Name of this namespace
     /// \param File        Source file
     /// \param LineNo      Line number
+    /// \param ExportSymbols True for C++ inline namespaces.
     DINamespace *createNameSpace(DIScope *Scope, StringRef Name, DIFile *File,
-                                 unsigned LineNo);
+                                 unsigned LineNo, bool ExportSymbols);
 
     /// This creates new descriptor for a module with the specified
     /// parent scope.
@@ -734,6 +779,7 @@ namespace llvm {
       return Replacement;
     }
   };
+
 } // end namespace llvm
 
-#endif
+#endif // LLVM_IR_DIBUILDER_H
